@@ -11,10 +11,10 @@
 // Fixed-width underlying type so the forward declaration in Menu.hpp matches.
 enum BUTTONS : int
 {
-    BUTTON_UP     = 1,
-    BUTTON_DOWN   = 2,
-    BUTTON_LEFT   = 3,
-    BUTTON_RIGHT  = 4,
+    BUTTON_UP = 1,
+    BUTTON_DOWN = 2,
+    BUTTON_LEFT = 3,
+    BUTTON_RIGHT = 4,
     BUTTON_CENTER = 5,
 };
 
@@ -34,14 +34,14 @@ public:
 private:
     static void live_loop(void *pvParameters);
 
-    TFT_eSPI    tft;
+    TFT_eSPI tft;
     TFT_eSprite sprite;
-    char        buffer[13][100];
-    int         buffer_index;
-    int         prev_button_value;
-    int         current_button_value;
-    int         prev_read_button_value;
-    uint32_t    last_frame_time = 0;
+    char buffer[13][100];
+    int buffer_index;
+    int prev_button_value;
+    int current_button_value;
+    int prev_read_button_value;
+    uint32_t last_frame_time = 0;
 };
 
 extern UIManager uiManager;

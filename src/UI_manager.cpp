@@ -42,8 +42,8 @@ UIManager::UIManager() : tft(TFT_eSPI()), sprite(TFT_eSprite(&tft)), buffer_inde
     sprite.pushSprite(0, 0);
 
     pinMode(ADC_PIN, INPUT);
-    prev_button_value      = 0;
-    current_button_value   = 0;
+    prev_button_value = 0;
+    current_button_value = 0;
     prev_read_button_value = 0;
 
     xTaskCreatePinnedToCore(
@@ -53,8 +53,7 @@ UIManager::UIManager() : tft(TFT_eSPI()), sprite(TFT_eSprite(&tft)), buffer_inde
         this,
         1,
         NULL,
-        0
-    );
+        0);
 }
 
 // ---------------------------------------------------------------------------
@@ -138,7 +137,7 @@ void UIManager::live_loop(void *pvParameters)
             ui->sprite.drawString(String(ui->prev_read_button_value).c_str(), 50, 0);
 
         // Debug log lines
-        ui->sprite.setTextColor(sprite.color565(150,150,150), 0);
+        ui->sprite.setTextColor(sprite.color565(150, 150, 150), 0);
         for (int i = 0; i < 13; i++)
             ui->sprite.drawString(ui->buffer[(ui->buffer_index - i - 1 + 13) % 13], 0, 170 - 15 - i * 15);
 #endif

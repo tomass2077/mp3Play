@@ -1,155 +1,700 @@
-#include "UI_manager.hpp"
-#include "menus/FileListMenu.hpp"
-#include "menus/SettingsMenu.hpp"
+// =============================================================================
+//  UI_manager.cpp — menu-based UI for mp3Play
+//
+//  Layout (320 × 170):
+//    ┌──────────────────────┬───────────┐
+//    │  LEFT PANEL (220 px) │ RIGHT     │
+//    │  Albums / Songs /    │ Now       │
+//    │  Settings            │ Playing + │
+//    │                      │ Controls  │
+//    └──────────────────────┴───────────┘
+//
+//  Focus::LEFT
+//    Up/Down  — move cursor in list
+//    OK       — select / open
+//    Right    — jump to right panel
+//    Hold OK (600 ms) — toggle Settings
+//
+//  Focus::RIGHT
+//    Left/Right — cycle between |<  []  >| buttons
+//    OK         — activate selected button
+//    Left from |< — return to left panel
+// =============================================================================
 
-#define ADC_PIN 1
+#include "UI_manager.hpp"
+#include <esp_system.h>
+
+// Left panel list layout
+static const int kHeaderH = 16;
+static const int kListRows = 8;
+static const int kRowH = 18;
+static const int kListY = kHeaderH;
+
+// Right panel geometry (100 px wide)
+static const int kRightX = DIVIDER_X + 3;
+static const int kRightW = RIGHT_W - 5;
+
+// Title scroll: 1 px every 60 ms, pause 1.5 s at start/end
+static const uint32_t kScrollTickMs = 60;
+static const uint32_t kScrollPauseMs = 1500;
 
 UIManager uiManager;
-MenuManager menuManager;
 
 // ---------------------------------------------------------------------------
-// Static menu instances (avoids heap fragmentation on embedded target)
+// Constructor
 // ---------------------------------------------------------------------------
-static FileListMenu s_fileListMenu;
-static SettingsMenu s_settingsMenu;
-
-// ---------------------------------------------------------------------------
-// Button ADC detection
-// ---------------------------------------------------------------------------
-const int ButtonDelta = 6;
-const int buttonAnalogs[5] = {520, 1240, 0, 1950, 2920};
-
-// ---------------------------------------------------------------------------
-
-UIManager::UIManager() : tft(TFT_eSPI()), sprite(TFT_eSprite(&tft)), buffer_index(0)
+UIManager::UIManager() : tft(TFT_eSPI()), sprite(TFT_eSprite(&tft)),
+                         titleSprite(TFT_eSprite(&tft)),
+                         windowSprite(TFT_eSprite(&tft))
 {
-    for (int i = 0; i < 13; i++)
-        snprintf(buffer[i], sizeof(buffer[i]), "");
+    for (auto &row : logBuf)
+        row[0] = '\0';
+    titleCache[0] = '\0';
 
-    pinMode(15, OUTPUT);
-    digitalWrite(15, HIGH);
+    pinMode(PIN_POWER_ON, OUTPUT);
+    digitalWrite(PIN_POWER_ON, HIGH);
 
     tft.init();
     tft.setRotation(3);
-    sprite.createSprite(320, 170);
-    sprite.setSwapBytes(1);
+    sprite.createSprite(SCREEN_W, SCREEN_H);
+    sprite.setSwapBytes(true);
 
+    // Backlight
     ledcSetup(0, 10000, 8);
-    ledcAttachPin(38, 0);
+    ledcAttachPin(PIN_LCD_BL, 0);
     ledcWrite(0, 160);
 
     sprite.fillSprite(TFT_BLACK);
     sprite.pushSprite(0, 0);
 
     pinMode(ADC_PIN, INPUT);
-    prev_button_value = 0;
-    current_button_value = 0;
-    prev_read_button_value = 0;
 
-    xTaskCreatePinnedToCore(
-        live_loop,
-        "uiTask",
-        12288,
-        this,
-        1,
-        NULL,
-        0);
+    xTaskCreatePinnedToCore(live_loop, "uiTask", 16384, this, 1, NULL, 0);
 }
 
 // ---------------------------------------------------------------------------
-// UI task — runs on Core 0
+// Debug log
+// ---------------------------------------------------------------------------
+void UIManager::bufferPrint(const char *message)
+{
+    snprintf(logBuf[logIdx], sizeof(logBuf[logIdx]), "%s", message);
+    logIdx = (logIdx + 1) % 8;
+    Serial.println(message);
+}
+
+// ---------------------------------------------------------------------------
+// Button reading
+// Returns BTN_UP / BTN_DOWN / BTN_LEFT / BTN_RIGHT / BTN_OK on rising edge,
+// -1 otherwise.
+// ---------------------------------------------------------------------------
+int UIManager::readBtn()
+{
+    int raw = configManager.readRawBtn(); // -1 or 0-4
+
+    int edge = -1;
+    if (raw != prevRaw)
+    {
+        if (raw >= 0 && prevRaw < 0) // rising edge
+            edge = raw;
+        prevRaw = raw;
+    }
+    return edge;
+}
+
+// ---------------------------------------------------------------------------
+// Library helpers
+// ---------------------------------------------------------------------------
+void UIManager::loadLibrary()
+{
+    if (libLoaded)
+        return;
+    library = musicManager.scanLibrary();
+    libLoaded = true;
+    albumSel = 0;
+    albumScroll = 0;
+}
+
+void UIManager::openAlbum(int idx)
+{
+    openAlbumIdx = idx;
+    songSel = 0;
+    songScroll = 0;
+    leftMode = LeftMode::SONGS;
+}
+
+void UIManager::playSong(int sIdx)
+{
+    if (openAlbumIdx < 0 || openAlbumIdx >= (int)library.size())
+        return;
+    const auto &songs = library[openAlbumIdx].songs;
+    if (sIdx < 0 || sIdx >= (int)songs.size())
+        return;
+    playAlbum = openAlbumIdx;
+    playSongIdx = sIdx;
+    musicManager.play(songs[sIdx].path.c_str());
+}
+
+void UIManager::playNext(int delta)
+{
+    if (playAlbum < 0 || playAlbum >= (int)library.size())
+        return;
+    const auto &songs = library[playAlbum].songs;
+    if (songs.empty())
+        return;
+    playSongIdx = (playSongIdx + delta + (int)songs.size()) % (int)songs.size();
+    musicManager.play(songs[playSongIdx].path.c_str());
+}
+
+// ---------------------------------------------------------------------------
+// Scroll helpers (clamped scroll so selection stays visible)
+// ---------------------------------------------------------------------------
+static void scrollToShow(int sel, int &scroll, int rows)
+{
+    if (sel < scroll)
+        scroll = sel;
+    if (sel >= scroll + rows)
+        scroll = sel - rows + 1;
+}
+
+// ---------------------------------------------------------------------------
+// Input — LEFT panel
+// ---------------------------------------------------------------------------
+void UIManager::handleLeft(int btn, uint32_t holdMs)
+{
+    // Hold OK → toggle Settings
+    if (holdMs >= HOLD_SETTINGS_MS && !centerHeld)
+    {
+        centerHeld = true;
+        if (leftMode == LeftMode::SETTINGS)
+        {
+            settingEditing = false;
+            leftMode = (openAlbumIdx >= 0) ? LeftMode::SONGS : LeftMode::ALBUMS;
+        }
+        else
+        {
+            settingEditing = false;
+            settingSel = SettingItem::VOLUME;
+            leftMode = LeftMode::SETTINGS;
+        }
+        return;
+    }
+    if (holdMs > 0)
+        return; // still holding — suppress taps
+
+    // Right → jump to right panel
+    if (btn == BTN_RIGHT)
+    {
+        focus = Focus::RIGHT;
+        return;
+    }
+
+    if (leftMode == LeftMode::ALBUMS)
+    {
+        int n = (int)library.size();
+        if (n == 0)
+            return;
+        if (btn == BTN_UP)
+        {
+            albumSel = (albumSel - 1 + n) % n;
+            scrollToShow(albumSel, albumScroll, kListRows);
+        }
+        if (btn == BTN_DOWN)
+        {
+            albumSel = (albumSel + 1) % n;
+            scrollToShow(albumSel, albumScroll, kListRows);
+        }
+        if (btn == BTN_OK)
+        {
+            openAlbum(albumSel);
+        }
+    }
+    else if (leftMode == LeftMode::SONGS)
+    {
+        if (openAlbumIdx < 0 || openAlbumIdx >= (int)library.size())
+            return;
+        int n = (int)library[openAlbumIdx].songs.size() + 1; // +1 for Back
+        if (btn == BTN_UP)
+        {
+            songSel = (songSel - 1 + n) % n;
+            scrollToShow(songSel, songScroll, kListRows);
+        }
+        if (btn == BTN_DOWN)
+        {
+            songSel = (songSel + 1) % n;
+            scrollToShow(songSel, songScroll, kListRows);
+        }
+        if (btn == BTN_OK)
+        {
+            if (songSel == 0)
+                leftMode = LeftMode::ALBUMS;
+            else
+            {
+                playSong(songSel - 1);
+                focus = Focus::RIGHT;
+                rightSel = 1; // land on play/pause
+            }
+        }
+    }
+    else if (leftMode == LeftMode::SETTINGS)
+    {
+        if (!settingEditing)
+        {
+            // Navigate between setting items
+            if (btn == BTN_UP)
+                settingSel = (settingSel == SettingItem::VOLUME) ? SettingItem::CLEAR_CONFIG : SettingItem::VOLUME;
+            if (btn == BTN_DOWN)
+                settingSel = (settingSel == SettingItem::VOLUME) ? SettingItem::CLEAR_CONFIG : SettingItem::VOLUME;
+            if (btn == BTN_OK)
+            {
+                if (settingSel == SettingItem::CLEAR_CONFIG)
+                {
+                    // Wipe EEPROM and reboot — calibration will run on next boot
+                    EEPROM.begin(CONFIG_EEPROM_SIZE);
+                    for (int i = 0; i < CONFIG_EEPROM_SIZE; i++)
+                        EEPROM.write(i, 0xFF);
+                    EEPROM.commit();
+                    EEPROM.end();
+                    Serial.println("[cfg] Config cleared — rebooting");
+                    vTaskDelay(pdMS_TO_TICKS(200));
+                    esp_restart();
+                }
+                else
+                {
+                    settingEditing = true;
+                }
+            }
+        }
+        else
+        {
+            PlayStats ps = musicManager.getPlayStats();
+            if (settingSel == SettingItem::VOLUME)
+            {
+                int v = ps.volume;
+                if (btn == BTN_LEFT && v > 0)
+                {
+                    musicManager.setVolume(v - 1);
+                    configManager.cfg.volume = v - 1;
+                    configManager.save();
+                }
+                if (btn == BTN_RIGHT && v < 21)
+                {
+                    musicManager.setVolume(v + 1);
+                    configManager.cfg.volume = v + 1;
+                    configManager.save();
+                }
+                if (btn == BTN_OK)
+                    settingEditing = false;
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Input — RIGHT panel (playback controls)
+// Left/Right cycle the selected button; OK activates it; Left from btn 0 → back
+// ---------------------------------------------------------------------------
+void UIManager::handleRight(int btn)
+{
+    if (btn == BTN_LEFT)
+    {
+        if (rightSel > 0)
+            rightSel--;
+        else
+            focus = Focus::LEFT; // exit right panel
+        return;
+    }
+    if (btn == BTN_RIGHT)
+    {
+        if (rightSel < 2)
+            rightSel++;
+        return;
+    }
+    if (btn == BTN_OK)
+    {
+        switch (rightSel)
+        {
+        case 0:
+            playNext(-1);
+            break; // prev
+        case 1:
+            musicManager.pause();
+            break; // play/pause
+        case 2:
+            playNext(+1);
+            break; // next
+        }
+    }
+    // Up/Down do nothing on right panel (could be used for volume in future)
+}
+
+// ---------------------------------------------------------------------------
+// Title sprite cache — rebuilds only when the title string changes
+// ---------------------------------------------------------------------------
+void UIManager::rebuildTitleSprite(const char *title)
+{
+    if (strcmp(title, titleCache) == 0)
+        return; // same title, no rebuild needed
+
+    strlcpy(titleCache, title, sizeof(titleCache));
+
+    // Delete old sprite if it exists
+    titleSprite.deleteSprite();
+
+    // Measure text width using the main sprite (font already loaded there)
+    int textW = sprite.textWidth(title);
+    if (textW <= 0)
+        textW = 1;
+
+    titleSpriteW = textW;
+    titleScrollOff = 0;
+    titleScrollMs = 0; // pause at start
+
+    // Create a 15px-tall sprite exactly as wide as the text
+    titleSprite.createSprite(textW, 15);
+    titleSprite.loadFont(NotoSansBold15);
+    titleSprite.fillSprite(TFT_BLACK);
+    titleSprite.setTextColor(TFT_WHITE, TFT_BLACK);
+    titleSprite.setTextDatum(TL_DATUM);
+    titleSprite.drawString(title, 0, 0);
+}
+
+// ---------------------------------------------------------------------------
+// Drawing — Albums
+// ---------------------------------------------------------------------------
+void UIManager::drawAlbums()
+{
+    sprite.setTextColor(COL_ORANGE, TFT_BLACK);
+    sprite.drawString("Albums", 4, 1);
+
+    int n = (int)library.size();
+    for (int i = 0; i < kListRows && (albumScroll + i) < n; i++)
+    {
+        int idx = albumScroll + i;
+        int y = kListY + i * kRowH;
+        bool sel = (idx == albumSel) && (focus == Focus::LEFT);
+        uint16_t bg = sel ? 0x3186 : TFT_BLACK;
+        if (sel)
+            sprite.fillRect(0, y, LEFT_W, kRowH, bg);
+        sprite.setTextColor(sel ? TFT_WHITE : 0xBDF7, bg);
+        sprite.drawString(library[idx].name.c_str(), 4, y + 2);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Drawing — Songs
+// ---------------------------------------------------------------------------
+void UIManager::drawSongs()
+{
+    if (openAlbumIdx < 0 || openAlbumIdx >= (int)library.size())
+        return;
+    const auto &songs = library[openAlbumIdx].songs;
+
+    sprite.setTextColor(COL_ORANGE, TFT_BLACK);
+    sprite.drawString(library[openAlbumIdx].name.c_str(), 4, 1);
+
+    int total = (int)songs.size() + 1; // +1 for Back
+    for (int i = 0; i < kListRows && (songScroll + i) < total; i++)
+    {
+        int idx = songScroll + i;
+        int y = kListY + i * kRowH;
+        bool sel = (idx == songSel) && (focus == Focus::LEFT);
+        bool playing = (idx > 0) && (playAlbum == openAlbumIdx && playSongIdx == idx - 1);
+        uint16_t bg = sel ? 0x3186 : TFT_BLACK;
+        if (sel)
+            sprite.fillRect(0, y, LEFT_W, kRowH, bg);
+        uint16_t fg = sel ? TFT_WHITE : (playing ? COL_ORANGE : 0xBDF7);
+        sprite.setTextColor(fg, bg);
+
+        if (idx == 0)
+            sprite.drawString("<- Back", 4, y + 2);
+        else
+        {
+            const SongInfo &s = songs[idx - 1];
+            sprite.drawString(s.title.empty() ? s.filename.c_str() : s.title.c_str(), 4, y + 2);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Drawing — Settings
+// ---------------------------------------------------------------------------
+void UIManager::drawSettings()
+{
+    sprite.setTextColor(COL_ORANGE, TFT_BLACK);
+    sprite.drawString("Settings", 4, 1);
+
+    PlayStats ps = musicManager.getPlayStats();
+    bool panelSel = (focus == Focus::LEFT);
+
+    // ---- Row 0: Volume ----
+    {
+        bool rowSel = panelSel && (settingSel == SettingItem::VOLUME);
+        uint16_t bg = (settingEditing && rowSel) ? 0x2104 : (rowSel ? 0x3186 : TFT_BLACK);
+        int y = kListY;
+        sprite.fillRect(0, y, LEFT_W, kRowH, bg);
+
+        char volStr[16];
+        int vol = ps.volume;
+        snprintf(volStr, sizeof(volStr), "Vol %2d ", vol);
+        int labelW = sprite.textWidth(volStr);
+        sprite.setTextColor((settingEditing && rowSel) ? COL_ORANGE : (rowSel ? TFT_WHITE : 0x8C71), bg);
+        sprite.drawString(volStr, 4, y + 2);
+
+        int bx = 4 + labelW, by = y + kRowH / 2 - 2;
+        int bw = LEFT_W - bx - 8, bh = 4;
+        sprite.fillRect(bx, by, bw, bh, 0x2104);
+        sprite.fillRect(bx, by, bw * vol / 21, bh, (settingEditing && rowSel) ? COL_ORANGE : 0x8C71);
+
+        if (settingEditing && rowSel)
+        {
+            sprite.setTextColor(0x8C71, TFT_BLACK);
+            sprite.drawString("L/R adjust   OK done", 4, y + kRowH + 2);
+        }
+    }
+
+    // ---- Row 1: Clear config ----
+    {
+        bool rowSel = panelSel && (settingSel == SettingItem::CLEAR_CONFIG);
+        uint16_t bg = rowSel ? 0x3186 : TFT_BLACK;
+        int y = kListY + kRowH;
+        sprite.fillRect(0, y, LEFT_W, kRowH, bg);
+        // Red tint for destructive action
+        uint16_t fg = rowSel ? 0xF800 : 0x8C71; // bright red when selected, dim otherwise
+        sprite.setTextColor(fg, bg);
+        sprite.drawString("Clear config + reboot", 4, y + 2);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Drawing — Now Playing (right panel, top section)
+// ---------------------------------------------------------------------------
+void UIManager::drawNowPlaying(const PlayStats &ps)
+{
+    sprite.setTextColor(COL_ORANGE, TFT_BLACK);
+    sprite.drawString("NOW", kRightX, 2);
+    sprite.drawFastHLine(DIVIDER_X, 16, RIGHT_W, 0x3186);
+
+    if (!ps.isPlaying && !ps.isPaused)
+    {
+        sprite.setTextColor(0x4A49, TFT_BLACK);
+        sprite.drawString("---", kRightX, 20);
+        return;
+    }
+
+    int y = 18;
+
+    // Artist — truncate if needed
+    if (ps.artist[0])
+    {
+        sprite.setTextColor(0x8C71, TFT_BLACK);
+        char artist[64];
+        strlcpy(artist, ps.artist, sizeof(artist));
+        while (artist[0] && sprite.textWidth(artist) > kRightW)
+            artist[strlen(artist) - 1] = '\0';
+        sprite.drawString(artist, kRightX, y);
+        y += 14;
+    }
+
+    // Title — scrolling marquee using pre-rendered sprite
+    {
+        const char *title = ps.title[0] ? ps.title : "Unknown";
+        rebuildTitleSprite(title); // no-op if title unchanged
+
+        if (titleSpriteW <= kRightW)
+        {
+            // Fits — blit into the main sprite (not directly to TFT)
+            titleSprite.pushToSprite(&sprite, kRightX, y);
+        }
+        else
+        {
+            // Clip: use the persistent window sprite, then blit that into the
+            // main sprite so the title is part of the same double-buffered frame.
+            if (windowSprite.width() != kRightW || windowSprite.height() != 15)
+            {
+                windowSprite.deleteSprite();
+                windowSprite.createSprite(kRightW, 15);
+            }
+            windowSprite.fillSprite(TFT_BLACK);
+            titleSprite.pushToSprite(&windowSprite, -titleScrollOff, 0);
+            windowSprite.pushToSprite(&sprite, kRightX, y);
+        }
+        y += 16;
+    }
+
+    // Progress bar
+    if (ps.durationSec > 0)
+    {
+        int filled = (int)((float)ps.positionSec / ps.durationSec * kRightW);
+        sprite.fillRect(kRightX, y, kRightW, 4, 0x2104);
+        sprite.fillRect(kRightX, y, filled, 4, COL_ORANGE);
+        y += 7;
+
+        char timeStr[12];
+        snprintf(timeStr, sizeof(timeStr), "%lu:%02lu/%lu:%02lu",
+                 (unsigned long)(ps.positionSec / 60), (unsigned long)(ps.positionSec % 60),
+                 (unsigned long)(ps.durationSec / 60), (unsigned long)(ps.durationSec % 60));
+        sprite.setTextColor(0x4A49, TFT_BLACK);
+        sprite.drawString(timeStr, kRightX, y);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Drawing — Playback buttons (right panel, bottom)
+// ---------------------------------------------------------------------------
+void UIManager::drawPlaybackBtns(const PlayStats &ps)
+{
+    static const int btnH = 22;
+    static const int btnW = 30;
+    static const int gap = 2;
+    static const int totalW = 3 * btnW + 2 * gap; // 94
+    static const int startX = DIVIDER_X + (RIGHT_W - totalW) / 2;
+    static const int btnY = SCREEN_H - btnH - 2;
+
+    bool hasFocus = (focus == Focus::RIGHT);
+    const char *labels[3] = {"|<", ps.isPaused ? "|>" : "[]", ">|"};
+
+    for (int i = 0; i < 3; i++)
+    {
+        int bx = startX + i * (btnW + gap);
+        bool sel = hasFocus && (i == rightSel);
+
+        uint16_t bg = sel ? 0x528A : (hasFocus ? 0x3186 : 0x2104);
+        uint16_t fg = sel ? COL_ORANGE : (hasFocus ? TFT_WHITE : 0x4A49);
+        uint16_t bdr = sel ? COL_ORANGE : (hasFocus ? 0x528A : 0x2104);
+
+        sprite.fillRect(bx, btnY, btnW, btnH, bg);
+        sprite.drawRect(bx, btnY, btnW, btnH, bdr);
+        sprite.setTextColor(fg, bg);
+        sprite.setTextDatum(MC_DATUM);
+        sprite.drawString(labels[i], bx + btnW / 2, btnY + btnH / 2 - 1);
+        sprite.setTextDatum(TL_DATUM);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// drawLeft / drawRight
+// ---------------------------------------------------------------------------
+void UIManager::drawLeft()
+{
+    sprite.setTextDatum(TL_DATUM);
+    if (leftMode == LeftMode::ALBUMS)
+        drawAlbums();
+    else if (leftMode == LeftMode::SONGS)
+        drawSongs();
+    else if (leftMode == LeftMode::SETTINGS)
+        drawSettings();
+}
+
+void UIManager::drawRight()
+{
+    PlayStats ps = musicManager.getPlayStats();
+    uint16_t divCol = (focus == Focus::RIGHT) ? COL_ORANGE : 0x2104;
+    sprite.drawFastVLine(DIVIDER_X, 0, SCREEN_H, divCol);
+    drawNowPlaying(ps);
+    drawPlaybackBtns(ps);
+}
+
+// ---------------------------------------------------------------------------
+// Main UI task — Core 0
 // ---------------------------------------------------------------------------
 void UIManager::live_loop(void *pvParameters)
 {
     UIManager *ui = static_cast<UIManager *>(pvParameters);
     ui->sprite.loadFont(NotoSansBold15);
 
+    // Wait for MusicManager
     while (!musicManager.started)
-        vTaskDelay(25);
+        vTaskDelay(pdMS_TO_TICKS(25));
 
-    // Push the root menu (folder browser).
-    // BUTTON_RIGHT from FileListMenu opens Settings.
-    menuManager.push(&s_fileListMenu);
+    // Load config (EEPROM). If invalid → run calibration wizard.
+    if (!configManager.load())
+    {
+        Serial.println("[ui] No valid config — running calibration");
+        configManager.runCalibration(ui->tft, ui->sprite);
+    }
 
-    ui->bufferPrint("Menu system ready");
+    // Apply saved volume
+    musicManager.setVolume(configManager.cfg.volume);
 
-    uint32_t last_time = micros();
+    // Scan SD library
+    ui->loadLibrary();
 
     while (true)
     {
-        // ---- Button reading ----
-        int adcValue = analogRead(ADC_PIN);
-        int last_button_value = ui->current_button_value;
-        ui->current_button_value = 0;
-        for (int i = 0; i < 5; i++)
-            if (abs(adcValue - buttonAnalogs[i]) < ButtonDelta)
+        uint32_t now = millis();
+
+        // ---- button ----
+        int btn = ui->readBtn();
+
+        // Track OK hold
+        bool okDown = (ui->prevRaw == BTN_OK);
+        uint32_t holdMs = 0;
+        if (okDown)
+        {
+            if (ui->btnDownMs == 0)
+                ui->btnDownMs = now;
+            holdMs = now - ui->btnDownMs;
+        }
+        else
+        {
+            ui->btnDownMs = 0;
+            ui->centerHeld = false;
+        }
+
+        // SD hot-swap reset
+        if (ui->libLoaded && !musicManager.isCardPresent())
+        {
+            ui->library.clear();
+            ui->libLoaded = false;
+            ui->openAlbumIdx = -1;
+            ui->albumSel = 0;
+            ui->albumScroll = 0;
+            ui->leftMode = LeftMode::ALBUMS;
+            ui->focus = Focus::LEFT;
+        }
+        if (!ui->libLoaded && musicManager.isCardPresent())
+            ui->loadLibrary();
+
+        // ---- dispatch ----
+        if (ui->focus == Focus::LEFT)
+            ui->handleLeft(btn, holdMs);
+        else
+            ui->handleRight(btn);
+
+        // ---- title scroll tick ----
+        {
+            PlayStats ps = musicManager.getPlayStats();
+            if ((ps.isPlaying || ps.isPaused) && ui->titleSpriteW > kRightW)
             {
-                ui->current_button_value = i + 1;
-                break;
+                // Pause at the start position
+                if (ui->titleScrollOff == 0 && ui->titleScrollMs == 0)
+                {
+                    ui->titleScrollMs = now; // mark pause start
+                }
+                else if (now - ui->titleScrollMs >= (ui->titleScrollOff == 0 ? kScrollPauseMs : kScrollTickMs))
+                {
+                    ui->titleScrollMs = now;
+                    ui->titleScrollOff++;
+                    // Pause again once fully scrolled off (gap before reset)
+                    if (ui->titleScrollOff > ui->titleSpriteW + 20)
+                        ui->titleScrollOff = 0;
+                }
             }
-        // Detect rising edge
-        if (ui->current_button_value != ui->prev_button_value)
-        {
-            ui->prev_button_value = ui->current_button_value;
-            ui->current_button_value = 0;
-        }
-        if (ui->current_button_value != last_button_value)
-            ui->prev_read_button_value = ui->current_button_value;
-
-        // ---- Timing ----
-        uint32_t now = micros();
-        uint32_t dtUs = now - last_time;
-        last_time = now;
-
-        // ---- Hot-swap: rescan when needed ----
-        // (MenuManager menus call scanLibrary which handles this internally)
-
-        // ---- Clear frame ----
-        ui->sprite.fillSprite(TFT_BLACK);
-        ui->sprite.setTextDatum(0);
-        ui->sprite.setTextColor(TFT_WHITE, 0);
-
-        // ---- Dispatch button ----
-        int cur_button = ui->readButton_press();
-        if (cur_button != 0)
-        {
-            ui->bufferPrint(("Button: " + std::to_string(cur_button)).c_str());
-
-            // BUTTON_RIGHT at root level opens/closes Settings
-            if (cur_button == BUTTON_RIGHT && menuManager.depth() == 1)
-                menuManager.push(&s_settingsMenu);
             else
-                menuManager.onButton(static_cast<BUTTONS>(cur_button));
+            {
+                ui->titleScrollOff = 0;
+                ui->titleScrollMs = 0;
+            }
         }
 
-        // ---- Update & draw active menu ----
-        menuManager.update(dtUs);
-        menuManager.draw(ui->sprite);
+        // ---- draw ----
+        ui->sprite.fillSprite(TFT_BLACK);
+        ui->sprite.setTextDatum(TL_DATUM);
 
-        // ---- Debug overlay ----
-#ifdef DEBUG
-        float fps = dtUs > 0 ? 1000000.0f / dtUs : 0;
-        ui->sprite.fillRect(0, 0, 320, 15, TFT_BLACK);
-        ui->sprite.setTextColor(TFT_GREEN, 0);
-        ui->sprite.drawString(String(fps, 1).c_str(), 0, 0);
-        ui->sprite.setTextColor(TFT_RED, 0);
-        if (ui->prev_read_button_value > 0)
-            ui->sprite.drawString(String(ui->prev_read_button_value).c_str(), 50, 0);
-
-        // Debug log lines
-        ui->sprite.setTextColor(sprite.color565(150, 150, 150), 0);
-        for (int i = 0; i < 13; i++)
-            ui->sprite.drawString(ui->buffer[(ui->buffer_index - i - 1 + 13) % 13], 0, 170 - 15 - i * 15);
-#endif
+        ui->drawLeft();
+        ui->drawRight();
 
         ui->sprite.pushSprite(0, 0);
-        vTaskDelay(1);
+        vTaskDelay(pdMS_TO_TICKS(20));
     }
-}
-
-void UIManager::bufferPrint(const char *message)
-{
-    snprintf(buffer[buffer_index], sizeof(buffer[buffer_index]), "%s", message);
-    buffer_index = (buffer_index + 1) % 13;
-    Serial.println(message);
 }

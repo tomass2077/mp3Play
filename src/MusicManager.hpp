@@ -9,8 +9,8 @@
 #include <string>
 
 #define I2S_BCLK_PIN 17
-#define I2S_LRC_PIN 15  // WARNING: pick a free GPIO; 17 conflicts with PIN_IIC_SCL
-#define I2S_DOUT_PIN 21 // WARNING: 21 conflicts with PIN_TOUCH_RES
+#define I2S_LRC_PIN 15
+#define I2S_DOUT_PIN 21
 
 // SD card detect / hot-swap poll interval (ms)
 #define SD_POLL_INTERVAL_MS 500
@@ -72,6 +72,7 @@ public:
     // -----------------------------------------------------------------------
 
     void play(const char *path);
+    void play(const char *path, const char *title, const char *artist, uint32_t durationSec = 0);
     void pause();
     void stop();
 
@@ -133,7 +134,10 @@ private:
     };
     Cmd _pendingCmd = Cmd::None;
     char _pendingPath[128] = {};
-    uint8_t _pendingVolume = 255; // 255 = no change pending
+    char _pendingTitle[64] = {};      // pre-seeded from cache; cleared after apply
+    char _pendingArtist[64] = {};     // pre-seeded from cache; cleared after apply
+    uint32_t _pendingDurationSec = 0; // pre-seeded from cache; cleared after apply
+    uint8_t _pendingVolume = 255;     // 255 = no change pending
 
     // SD state (loop-core writes, mutex for cross-core reads)
     bool _sdPresent = false;

@@ -51,8 +51,8 @@ UIManager::UIManager() : tft(TFT_eSPI()), sprite(TFT_eSprite(&tft)),
         row[0] = '\0';
     titleCache[0] = '\0';
 
-    pinMode(PIN_POWER_ON, OUTPUT);
-    digitalWrite(PIN_POWER_ON, HIGH);
+    // TpinMode(PIN_POWER_ON, OUTPUT);
+    // TdigitalWrite(PIN_POWER_ON, HIGH);
 
     tft.init();
     tft.setRotation(3);
@@ -131,7 +131,10 @@ void UIManager::playSong(int sIdx)
         return;
     playAlbum = openAlbumIdx;
     playSongIdx = sIdx;
-    musicManager.play(songs[sIdx].path.c_str());
+    musicManager.play(songs[sIdx].path.c_str(),
+                      songs[sIdx].title.c_str(),
+                      songs[sIdx].artist.c_str(),
+                      songs[sIdx].durationSec);
 }
 
 void UIManager::playNext(int delta)
@@ -142,7 +145,10 @@ void UIManager::playNext(int delta)
     if (songs.empty())
         return;
     playSongIdx = (playSongIdx + delta + (int)songs.size()) % (int)songs.size();
-    musicManager.play(songs[playSongIdx].path.c_str());
+    musicManager.play(songs[playSongIdx].path.c_str(),
+                      songs[playSongIdx].title.c_str(),
+                      songs[playSongIdx].artist.c_str(),
+                      songs[playSongIdx].durationSec);
 }
 
 // ---------------------------------------------------------------------------
@@ -176,32 +182,20 @@ static void truncateWithEllipsis(TFT_eSprite &spr, char *buf, size_t bufLen, int
 // ---------------------------------------------------------------------------
 void UIManager::handleLeft(int btn, uint32_t holdMs)
 {
-    // Hold OK → toggle Settings
-    if (holdMs >= HOLD_SETTINGS_MS && !centerHeld)
+    // Hold OK for 600 ms → toggle settings
+    if (btn == BTN_OK && holdMs >= 600 && !centerHeld)
     {
-        centerHeld = true;
-        if (leftMode == LeftMode::SETTINGS)
-        {
-            settingEditing = false;
-            leftMode = (openAlbumIdx >= 0) ? LeftMode::SONGS : LeftMode::ALBUMS;
-        }
-        else
-        {
-            settingEditing = false;
-            settingSel = SettingItem::VOLUME;
-            leftMode = LeftMode::SETTINGS;
-        }
+        centerHeld = true; // consume hold so release doesn't re-trigger
+        settingEditing = false;
+        settingSel = SettingItem::VOLUME;
+        leftMode = LeftMode::SETTINGS;
         return;
     }
-    if (holdMs > 0)
-        return; // still holding — suppress taps
 
-    // Right → jump to right panel
-    if (btn == BTN_RIGHT)
-    {
-        focus = Focus::RIGHT;
+    // Ignore repeats while held (btn == -1 means no rising edge this tick)
+    if (btn < 0)
         return;
-    }
+    // Right → jump to right panel
 
     if (leftMode == LeftMode::ALBUMS)
     {
@@ -222,6 +216,8 @@ void UIManager::handleLeft(int btn, uint32_t holdMs)
         {
             openAlbum(albumSel);
         }
+        if (btn == BTN_RIGHT)
+            focus = Focus::RIGHT;
     }
     else if (leftMode == LeftMode::SONGS)
     {
@@ -238,6 +234,10 @@ void UIManager::handleLeft(int btn, uint32_t holdMs)
             songSel = (songSel + 1) % n;
             scrollToShow(songSel, songScroll, kListRows);
         }
+        if (btn == BTN_LEFT)
+        {
+            leftMode = LeftMode::ALBUMS;
+        }
         if (btn == BTN_OK)
         {
             if (songSel == 0)
@@ -245,10 +245,12 @@ void UIManager::handleLeft(int btn, uint32_t holdMs)
             else
             {
                 playSong(songSel - 1);
-                focus = Focus::RIGHT;
-                rightSel = 1; // land on play/pause
+                // focus = Focus::RIGHT;
+                // rightSel = 1; // land on play/pause
             }
         }
+        if (btn == BTN_RIGHT)
+            focus = Focus::RIGHT;
     }
     else if (leftMode == LeftMode::SETTINGS)
     {
@@ -277,6 +279,11 @@ void UIManager::handleLeft(int btn, uint32_t holdMs)
                 {
                     settingEditing = true;
                 }
+            }
+            if (btn == BTN_RIGHT || btn == BTN_LEFT)
+            {
+                settingEditing = false;
+                leftMode = (openAlbumIdx >= 0) ? LeftMode::SONGS : LeftMode::ALBUMS;
             }
         }
         else
@@ -308,8 +315,11 @@ void UIManager::handleLeft(int btn, uint32_t holdMs)
 // Input — RIGHT panel (playback controls)
 // Left/Right cycle the selected button; OK activates it; Left from btn 0 → back
 // ---------------------------------------------------------------------------
-void UIManager::handleRight(int btn)
+void UIManager::handleRight(int btn, uint32_t holdMs)
 {
+    if (btn < 0)
+        return;
+
     if (btn == BTN_LEFT)
     {
         if (rightSel > 0)
@@ -322,6 +332,13 @@ void UIManager::handleRight(int btn)
     {
         if (rightSel < 2)
             rightSel++;
+        else
+        {
+            settingEditing = false;
+            settingSel = SettingItem::VOLUME;
+            leftMode = LeftMode::SETTINGS;
+            focus = Focus::LEFT; // jump to settings on right->right from "Next"
+        }
         return;
     }
     if (btn == BTN_OK)
@@ -491,9 +508,9 @@ void UIManager::drawSettings()
 // ---------------------------------------------------------------------------
 void UIManager::drawNowPlaying(const PlayStats &ps)
 {
-    sprite.setTextColor(COL_ORANGE, TFT_BLACK);
-    sprite.drawString("NOW", kRightX, 2);
-    sprite.drawFastHLine(DIVIDER_X, 16, RIGHT_W, 0x3186);
+    // sprite.setTextColor(COL_ORANGE, TFT_BLACK);
+    // sprite.drawString("NOW", kRightX, 2);
+    // sprite.drawFastHLine(DIVIDER_X, 16, RIGHT_W, 0x3186);
 
     if (!ps.isPlaying && !ps.isPaused)
     {
@@ -514,6 +531,16 @@ void UIManager::drawNowPlaying(const PlayStats &ps)
         }
         if (cachedArtLoaded && cachedArt.hasArt)
             sprite.pushImage(kArtX, kArtY, AlbumArt::W, AlbumArt::H, cachedArt.pixels);
+        else
+        {
+            // Draw Disc with spinning needle
+            sprite.fillRect(kArtX, kArtY, 64, 64, 0x1082);
+            sprite.drawRect(kArtX, kArtY, 64, 64, 0x2104);
+            sprite.setTextColor(0x2104, 0x1082);
+            sprite.setTextDatum(MC_DATUM);
+            sprite.drawString("?", kArtX + 32, kArtY + 32);
+            sprite.setTextDatum(TL_DATUM);
+        }
     }
     else
     {
@@ -662,6 +689,7 @@ void UIManager::live_loop(void *pvParameters)
     // Scan SD library
     ui->loadLibrary();
 
+    uint32_t last_ms = 0;
     while (true)
     {
         uint32_t now = millis();
@@ -669,19 +697,44 @@ void UIManager::live_loop(void *pvParameters)
         // ---- button ----
         int btn = ui->readBtn();
 
-        // Track OK hold
-        bool okDown = (ui->prevRaw == BTN_OK);
+        // Track hold time for any button (prevRaw is updated by readBtn() above)
+        // Release is debounced: heldBtn is only cleared after raw stays -1 for >30 ms
+        // to prevent ADC noise spikes from resetting the hold timer mid-press.
+        int curRaw = ui->prevRaw;
+        static const uint32_t kRelDebounceMs = 30;
         uint32_t holdMs = 0;
-        if (okDown)
+        if (curRaw >= 0)
         {
-            if (ui->btnDownMs == 0)
-                ui->btnDownMs = now;
-            holdMs = now - ui->btnDownMs;
+            ui->heldBtnRelMs = 0; // raw is active — reset release timer
+            if (ui->heldBtn != curRaw)
+            {
+                // New button pressed — reset timer
+                ui->heldBtn = curRaw;
+                ui->heldBtnDownMs = now;
+            }
+            holdMs = now - ui->heldBtnDownMs;
         }
         else
         {
-            ui->btnDownMs = 0;
-            ui->centerHeld = false;
+            if (ui->heldBtn >= 0)
+            {
+                // Raw went -1, but wait for debounce before declaring release
+                if (ui->heldBtnRelMs == 0)
+                    ui->heldBtnRelMs = now;
+                if (now - ui->heldBtnRelMs >= kRelDebounceMs)
+                {
+                    // Confirmed release
+                    ui->heldBtn = -1;
+                    ui->heldBtnDownMs = 0;
+                    ui->heldBtnRelMs = 0;
+                    ui->centerHeld = false;
+                }
+                else
+                {
+                    // Still within debounce window — treat as still held
+                    holdMs = now - ui->heldBtnDownMs;
+                }
+            }
         }
 
         // SD hot-swap reset
@@ -707,7 +760,7 @@ void UIManager::live_loop(void *pvParameters)
         if (ui->focus == Focus::LEFT)
             ui->handleLeft(btn, holdMs);
         else
-            ui->handleRight(btn);
+            ui->handleRight(btn, holdMs);
 
         // ---- title scroll tick ----
         {
@@ -741,6 +794,20 @@ void UIManager::live_loop(void *pvParameters)
 
         ui->drawLeft();
         ui->drawRight();
+
+        uint32_t drawTime = millis() - now;
+        last_ms = now;
+
+        if (drawTime > 0)
+        {
+            // Draw FPS
+            float fps = 1000.0 / drawTime;
+            char fpsStr[16];
+            snprintf(fpsStr, sizeof(fpsStr), "FPS: %.1f", fps);
+            ui->sprite.setTextColor(TFT_WHITE, TFT_BLACK);
+            ui->sprite.setTextDatum(TL_DATUM);
+            ui->sprite.drawString(fpsStr, 0, 0);
+        }
 
         ui->sprite.pushSprite(0, 0);
         vTaskDelay(pdMS_TO_TICKS(2));

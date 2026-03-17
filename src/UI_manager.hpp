@@ -66,7 +66,7 @@ private:
     // Returns BTN_UP/DOWN/LEFT/RIGHT/OK on a new press, -1 otherwise
     int readBtn();
     void handleLeft(int btn, uint32_t holdMs);
-    void handleRight(int btn);
+    void handleRight(int btn, uint32_t holdMs);
 
     // ---- helpers ----
     void loadLibrary();
@@ -120,8 +120,10 @@ private:
     bool cachedArtLoaded = false; // true once fetched for the current track
 
     // ---- button debounce ----
-    int prevRaw = -1;       // last raw btn index (-1 = none)
-    uint32_t btnDownMs = 0; // millis() when OK was first held
+    int prevRaw = -1;           // last raw btn index (-1 = none)
+    int heldBtn = -1;           // which button is currently held (-1 = none)
+    uint32_t heldBtnDownMs = 0; // millis() when the current button was first pressed
+    uint32_t heldBtnRelMs = 0;  // millis() when raw first went -1 (for release debounce)
     bool centerHeld = false;
 
     // ---- debug log ----

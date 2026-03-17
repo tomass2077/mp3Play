@@ -118,12 +118,18 @@ void MusicManager::loop()
 
     Cmd cmd = Cmd::None;
     char path[128] = {};
+    char title[64] = {};
+    char artist[64] = {};
     uint8_t vol = 255;
 
     xSemaphoreTake(_mutex, portMAX_DELAY);
     cmd = _pendingCmd;
     _pendingCmd = Cmd::None;
     strlcpy(path, _pendingPath, sizeof(path));
+    strlcpy(title, _pendingTitle, sizeof(title));
+    strlcpy(artist, _pendingArtist, sizeof(artist));
+    _pendingTitle[0] = '\0';
+    _pendingArtist[0] = '\0';
     vol = _pendingVolume;
     _pendingVolume = 255;
     xSemaphoreGive(_mutex);
@@ -143,8 +149,13 @@ void MusicManager::loop()
             _paused = false;
             strlcpy(_currentPath, path, sizeof(_currentPath));
             _albumArtReady = false; // clear stale art immediately
+            // Pre-seed title/artist from the library cache so the UI can
+            // display them right away, without waiting for the audio
+            // decoder's ID3 callback.
+            strlcpy(_title, title, sizeof(_title));
+            strlcpy(_artist, artist, sizeof(_artist));
             xSemaphoreGive(_mutex);
-            // Defer art decode to next loop iteration so audio starts without delay
+            // Queue art for the upcoming post-audio.loop() decode block.
             strlcpy(_pendingArtPath, path, sizeof(_pendingArtPath));
             break;
 
@@ -207,9 +218,17 @@ void MusicManager::loop()
 
 void MusicManager::play(const char *path)
 {
+    play(path, "", "");
+}
+
+void MusicManager::play(const char *path, const char *title, const char *artist, uint32_t durationSec)
+{
     xSemaphoreTake(_mutex, portMAX_DELAY);
     _pendingCmd = Cmd::Play;
     strlcpy(_pendingPath, path, sizeof(_pendingPath));
+    strlcpy(_pendingTitle, title ? title : "", sizeof(_pendingTitle));
+    strlcpy(_pendingArtist, artist ? artist : "", sizeof(_pendingArtist));
+    _pendingDurationSec = durationSec;
     xSemaphoreGive(_mutex);
 }
 
@@ -434,9 +453,11 @@ void MusicManager::onId3(const char *info)
     Serial.println(info);
 
     xSemaphoreTake(_mutex, portMAX_DELAY);
-    if (strncmp(info, "Title:", 6) == 0)
+    // Only overwrite if the library-cache pre-seed left the field empty,
+    // which avoids a flash of blank text followed by the decoded value.
+    if (strncmp(info, "Title:", 6) == 0 && _title[0] == '\0')
         strlcpy(_title, info + 6, sizeof(_title));
-    else if (strncmp(info, "Artist:", 7) == 0)
+    else if (strncmp(info, "Artist:", 7) == 0 && _artist[0] == '\0')
         strlcpy(_artist, info + 7, sizeof(_artist));
     xSemaphoreGive(_mutex);
 }

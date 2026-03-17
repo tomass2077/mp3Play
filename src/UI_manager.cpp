@@ -157,6 +157,21 @@ static void scrollToShow(int sel, int &scroll, int rows)
 }
 
 // ---------------------------------------------------------------------------
+// Truncate 'text' in-place so it fits within 'maxPx' pixels, appending "..."
+// ---------------------------------------------------------------------------
+static void truncateWithEllipsis(TFT_eSprite &spr, char *buf, size_t bufLen, int maxPx)
+{
+    if (spr.textWidth(buf) <= maxPx)
+        return;
+    // Reserve room for the ellipsis
+    int ellipsisW = spr.textWidth("...");
+    size_t len = strlen(buf);
+    while (len > 0 && spr.textWidth(buf) + ellipsisW > maxPx)
+        buf[--len] = '\0';
+    strlcat(buf, "...", bufLen);
+}
+
+// ---------------------------------------------------------------------------
 // Input — LEFT panel
 // ---------------------------------------------------------------------------
 void UIManager::handleLeft(int btn, uint32_t holdMs)
@@ -376,7 +391,10 @@ void UIManager::drawAlbums()
         if (sel)
             sprite.fillRect(0, y, LEFT_W, kRowH, bg);
         sprite.setTextColor(sel ? TFT_WHITE : 0xBDF7, bg);
-        sprite.drawString(library[idx].name.c_str(), 4, y + 2);
+        char albumName[64];
+        strlcpy(albumName, library[idx].name.c_str(), sizeof(albumName));
+        truncateWithEllipsis(sprite, albumName, sizeof(albumName), LEFT_W - 8);
+        sprite.drawString(albumName, 4, y + 2);
     }
 }
 
@@ -410,7 +428,10 @@ void UIManager::drawSongs()
         else
         {
             const SongInfo &s = songs[idx - 1];
-            sprite.drawString(s.title.empty() ? s.filename.c_str() : s.title.c_str(), 4, y + 2);
+            char songName[64];
+            strlcpy(songName, s.title.empty() ? s.filename.c_str() : s.title.c_str(), sizeof(songName));
+            truncateWithEllipsis(sprite, songName, sizeof(songName), LEFT_W - 8);
+            sprite.drawString(songName, 4, y + 2);
         }
     }
 }
@@ -481,9 +502,34 @@ void UIManager::drawNowPlaying(const PlayStats &ps)
         return;
     }
 
-    int y = 18;
+    // Album art — 64x64, centred horizontally in the right panel
+    static const int kArtY = 18;
+    static const int kArtX = DIVIDER_X + (RIGHT_W - 64) / 2; // centred
+    if (ps.albumArtReady)
+    {
+        // Fetch into the member buffer once per track (avoids 8 KB on stack)
+        if (!cachedArtLoaded)
+        {
+            cachedArtLoaded = musicManager.getAlbumArt(cachedArt);
+        }
+        if (cachedArtLoaded && cachedArt.hasArt)
+            sprite.pushImage(kArtX, kArtY, AlbumArt::W, AlbumArt::H, cachedArt.pixels);
+    }
+    else
+    {
+        cachedArtLoaded = false; // reset so we re-fetch when art becomes ready
+        // Placeholder box while art is loading or absent
+        sprite.fillRect(kArtX, kArtY, 64, 64, 0x1082);
+        sprite.drawRect(kArtX, kArtY, 64, 64, 0x2104);
+        sprite.setTextColor(0x2104, 0x1082);
+        sprite.setTextDatum(MC_DATUM);
+        sprite.drawString("?", kArtX + 32, kArtY + 32);
+        sprite.setTextDatum(TL_DATUM);
+    }
 
-    // Artist — truncate if needed
+    int y = kArtY + 64 + 3; // text starts below art
+
+    // Artist — truncate to fit
     if (ps.artist[0])
     {
         sprite.setTextColor(0x8C71, TFT_BLACK);
@@ -502,13 +548,10 @@ void UIManager::drawNowPlaying(const PlayStats &ps)
 
         if (titleSpriteW <= kRightW)
         {
-            // Fits — blit into the main sprite (not directly to TFT)
             titleSprite.pushToSprite(&sprite, kRightX, y);
         }
         else
         {
-            // Clip: use the persistent window sprite, then blit that into the
-            // main sprite so the title is part of the same double-buffered frame.
             if (windowSprite.width() != kRightW || windowSprite.height() != 15)
             {
                 windowSprite.deleteSprite();
@@ -651,9 +694,14 @@ void UIManager::live_loop(void *pvParameters)
             ui->albumScroll = 0;
             ui->leftMode = LeftMode::ALBUMS;
             ui->focus = Focus::LEFT;
+            ui->cachedArtLoaded = false;
         }
         if (!ui->libLoaded && musicManager.isCardPresent())
             ui->loadLibrary();
+
+        // ---- auto-advance to next song on EOF ----
+        if (musicManager.consumeEof())
+            ui->playNext(1);
 
         // ---- dispatch ----
         if (ui->focus == Focus::LEFT)
@@ -695,6 +743,6 @@ void UIManager::live_loop(void *pvParameters)
         ui->drawRight();
 
         ui->sprite.pushSprite(0, 0);
-        vTaskDelay(pdMS_TO_TICKS(20));
+        vTaskDelay(pdMS_TO_TICKS(2));
     }
 }

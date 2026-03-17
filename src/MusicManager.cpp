@@ -142,7 +142,10 @@ void MusicManager::loop()
             _playing = true;
             _paused = false;
             strlcpy(_currentPath, path, sizeof(_currentPath));
+            _albumArtReady = false; // clear stale art immediately
             xSemaphoreGive(_mutex);
+            // Defer art decode to next loop iteration so audio starts without delay
+            strlcpy(_pendingArtPath, path, sizeof(_pendingArtPath));
             break;
 
         case Cmd::Pause:
@@ -154,10 +157,13 @@ void MusicManager::loop()
 
         case Cmd::Stop:
             audio.stopSong();
+            _pendingArtPath[0] = '\0';
             xSemaphoreTake(_mutex, portMAX_DELAY);
             _playing = false;
             _paused = false;
+            _eofPending = false;
             _currentPath[0] = '\0';
+            _albumArtReady = false;
             xSemaphoreGive(_mutex);
             break;
 
@@ -167,6 +173,32 @@ void MusicManager::loop()
     }
 
     audio.loop();
+
+    // Deferred album art load — runs the tick *after* audio has started,
+    // keeping the art decode off the critical path.  AlbumArt is heap-
+    // allocated to avoid adding 8 KB to the loopTask stack.
+    if (_pendingArtPath[0] != '\0' && _sdPresent)
+    {
+        char artPath[128];
+        strlcpy(artPath, _pendingArtPath, sizeof(artPath));
+        _pendingArtPath[0] = '\0';
+
+        AlbumArt *art = new AlbumArt();
+        if (art)
+        {
+            File mf = SD_MMC.open(artPath);
+            if (mf)
+            {
+                readAlbumArt(mf, *art);
+                mf.close();
+            }
+            xSemaphoreTake(_mutex, portMAX_DELAY);
+            _albumArt = *art;
+            _albumArtReady = art->hasArt;
+            xSemaphoreGive(_mutex);
+            delete art;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -225,6 +257,7 @@ PlayStats MusicManager::getPlayStats()
     s.isPlaying = _playing;
     s.isPaused = _paused;
     s.isSdPresent = _sdPresent;
+    s.albumArtReady = _albumArtReady;
     strlcpy(s.currentPath, _currentPath, sizeof(s.currentPath));
     strlcpy(s.title, _title, sizeof(s.title));
     strlcpy(s.artist, _artist, sizeof(s.artist));
@@ -238,6 +271,16 @@ PlayStats MusicManager::getPlayStats()
     s.bitRate = audio.getBitRate();
     s.volume = audio.getVolume();
     return s;
+}
+
+bool MusicManager::getAlbumArt(AlbumArt &out)
+{
+    xSemaphoreTake(_mutex, portMAX_DELAY);
+    bool ready = _albumArtReady;
+    if (ready)
+        out = _albumArt;
+    xSemaphoreGive(_mutex);
+    return ready;
 }
 
 // ---------------------------------------------------------------------------
@@ -255,7 +298,7 @@ std::vector<FolderInfo> MusicManager::scanLibraryInternal()
         return library;
 
     FolderInfo rootFolder;
-    rootFolder.name = "";
+    rootFolder.name = "/";
 
     File entry = root.openNextFile();
     while (entry)
@@ -405,5 +448,15 @@ void MusicManager::onEof(const char *info)
     xSemaphoreTake(_mutex, portMAX_DELAY);
     _playing = false;
     _paused = false;
+    _eofPending = true;
     xSemaphoreGive(_mutex);
+}
+
+bool MusicManager::consumeEof()
+{
+    xSemaphoreTake(_mutex, portMAX_DELAY);
+    bool v = _eofPending;
+    _eofPending = false;
+    xSemaphoreGive(_mutex);
+    return v;
 }

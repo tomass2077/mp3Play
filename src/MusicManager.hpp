@@ -4,6 +4,7 @@
 #include "SD_MMC.h"
 #include "FS.h"
 #include "pin_config.h"
+#include "Mp3Meta.hpp"
 #include <vector>
 #include <string>
 
@@ -39,6 +40,7 @@ struct PlayStats
     bool isPlaying = false;
     bool isPaused = false;
     bool isSdPresent = false;
+    bool albumArtReady = false; // true when _albumArt holds valid art for currentPath
     uint32_t durationSec = 0;
     uint32_t positionSec = 0;
     uint32_t sampleRate = 0;
@@ -79,6 +81,10 @@ public:
     // Returns a snapshot safe to read from the UI core.
     PlayStats getPlayStats();
 
+    // Copy the current album art into `out`.
+    // Returns false (and leaves `out` unchanged) when no art is loaded.
+    bool getAlbumArt(AlbumArt &out);
+
     // Returns the cached library (scanned once per SD insertion).
     // Returns an empty vector if the card is absent.
     // Kicks off a fresh scan on the first call after a new insertion.
@@ -93,6 +99,10 @@ public:
     void onInfo(const char *info);
     void onId3(const char *info);
     void onEof(const char *info);
+
+    // Returns true (and clears the flag) when a song finished naturally.
+    // Call from the UI loop to trigger auto-advance.
+    bool consumeEof();
 
     bool started = false; // set to true after begin()
 
@@ -137,9 +147,14 @@ private:
     // Playback state
     bool _playing = false;
     bool _paused = false;
+    bool _eofPending = false; // set by onEof, consumed by consumeEof()
     char _currentPath[128] = {};
     char _title[64] = {};
     char _artist[64] = {};
+
+    AlbumArt _albumArt;             // decoded 64x64 RGB565 cover art for current track
+    bool _albumArtReady = false;    // true when _albumArt is valid for _currentPath
+    char _pendingArtPath[128] = {}; // non-empty = art load deferred to next loop tick
 
     uint32_t _lastSdPollMs = 0;
 };

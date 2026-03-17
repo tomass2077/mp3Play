@@ -115,6 +115,10 @@ private:
     int titleScrollOff = 0;
     uint32_t titleScrollMs = 0;
 
+    // ---- album art cache (avoids 8 KB on the UI task stack) ----
+    AlbumArt cachedArt;
+    bool cachedArtLoaded = false; // true once fetched for the current track
+
     // ---- button debounce ----
     int prevRaw = -1;       // last raw btn index (-1 = none)
     uint32_t btnDownMs = 0; // millis() when OK was first held

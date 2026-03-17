@@ -1,4 +1,5 @@
 #include "Mp3Meta.hpp"
+#include <TJpg_Decoder.h>
 
 // ---------------------------------------------------------------------------
 // Internal helpers
@@ -484,4 +485,199 @@ void readMp3Meta(File &f, Mp3Meta &out)
     uint32_t audioStart = parseId3v2(f, out);
     parseId3v1(f, out); // fills title/artist only if ID3v2 left them empty
     estimateDuration(f, audioStart, out);
+}
+
+// ---------------------------------------------------------------------------
+// Album art (APIC frame) reader
+// ---------------------------------------------------------------------------
+
+// TJpgDec output callback — writes decoded MCU blocks into the AlbumArt buffer.
+// `x`,`y` are the top-left pixel of this MCU block; `w`,`h` its size.
+// `bitmap` is an array of `w*h` uint16_t RGB565 pixels (row-major).
+static AlbumArt *s_artTarget = nullptr;
+
+static bool tjpgOutputCb(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t *bitmap)
+{
+    if (!s_artTarget)
+        return false;
+
+    // Clip to the 64x64 target
+    for (int row = 0; row < h; ++row)
+    {
+        int dy = y + row;
+        if (dy < 0 || dy >= AlbumArt::H)
+            continue;
+        for (int col = 0; col < w; ++col)
+        {
+            int dx = x + col;
+            if (dx < 0 || dx >= AlbumArt::W)
+                continue;
+            s_artTarget->pixels[dy * AlbumArt::W + dx] = bitmap[row * w + col];
+        }
+    }
+    return true;
+}
+
+// Locate the APIC frame in an already-opened ID3v2 block.
+// Returns the file offset and byte-length of the raw JPEG/PNG data,
+// or returns false if not found or not a JPEG.
+static bool findApicJpeg(File &f, uint32_t &dataOffset, uint32_t &dataLen)
+{
+    uint8_t hdr[10];
+    f.seek(0);
+    if (f.read(hdr, 10) != 10)
+        return false;
+    if (hdr[0] != 'I' || hdr[1] != 'D' || hdr[2] != '3')
+        return false;
+
+    uint8_t flags = hdr[5];
+    uint32_t tagSize = syncsafe(hdr + 6) + 10;
+
+    uint32_t extSize = 0;
+    if (flags & 0x40)
+    {
+        uint8_t ext[4];
+        if (f.read(ext, 4) == 4)
+            extSize = syncsafe(ext);
+        f.seek(10 + extSize);
+    }
+
+    uint32_t pos = 10 + extSize;
+    const uint32_t end = tagSize;
+
+    while (pos + 10 <= end)
+    {
+        uint8_t fhdr[10];
+        f.seek(pos);
+        if (f.read(fhdr, 10) != 10)
+            break;
+        if (fhdr[0] == 0)
+            break; // padding
+
+        uint32_t frameSize = readU32BE(fhdr + 4);
+        if (frameSize == 0 || pos + 10 + frameSize > end)
+            break;
+
+        bool isApic = (fhdr[0] == 'A' && fhdr[1] == 'P' && fhdr[2] == 'I' && fhdr[3] == 'C');
+        if (isApic && frameSize > 4)
+        {
+            // APIC frame layout (ID3v2.3):
+            //   [0]       text encoding
+            //   [1..]     MIME type (null-terminated ASCII, e.g. "image/jpeg")
+            //   [after 0] picture type (1 byte)
+            //   [after]   description (null-terminated, encoding-dependent)
+            //   [after]   picture data
+
+            // Read enough of the frame to parse the header (MIME + type + desc)
+            const uint32_t headerRead = (frameSize < 128) ? frameSize : 128;
+            uint8_t buf[128];
+            if (f.read(buf, headerRead) != (int)headerRead)
+                break;
+
+            // buf[0] = encoding, buf[1..] = MIME type
+            uint8_t enc = buf[0];
+            const uint8_t *mime = buf + 1;
+            uint32_t mimeEnd = 1;
+            while (mimeEnd < headerRead && buf[mimeEnd] != 0)
+                ++mimeEnd;
+            if (mimeEnd >= headerRead)
+                break; // malformed
+
+            // Check MIME type — only JPEG supported
+            bool isJpeg = (strncasecmp((const char *)mime, "image/jpeg", 10) == 0 ||
+                           strncasecmp((const char *)mime, "image/jpg", 9) == 0);
+            if (!isJpeg)
+                break; // not a JPEG — skip
+
+            // skip picture type byte (1)
+            uint32_t descStart = mimeEnd + 1 + 1; // +1 null, +1 picType
+            // skip description string (null-terminated; double-null for UTF-16)
+            if (enc == 0x01 || enc == 0x02)
+            {
+                // UTF-16: scan for 0x0000
+                while (descStart + 1 < headerRead &&
+                       !(buf[descStart] == 0 && buf[descStart + 1] == 0))
+                    descStart += 2;
+                descStart += 2; // skip the null terminator
+            }
+            else
+            {
+                while (descStart < headerRead && buf[descStart] != 0)
+                    ++descStart;
+                descStart += 1;
+            }
+
+            // Image data starts at pos+10+descStart in the file
+            dataOffset = pos + 10 + descStart;
+            dataLen = frameSize - descStart;
+            return dataLen > 0;
+        }
+
+        pos += 10 + frameSize;
+    }
+
+    return false;
+}
+
+bool readAlbumArt(File &f, AlbumArt &out)
+{
+    out.hasArt = false;
+    if (!f)
+        return false;
+
+    uint32_t dataOffset = 0;
+    uint32_t dataLen = 0;
+    if (!findApicJpeg(f, dataOffset, dataLen))
+        return false;
+
+    // Read the JPEG into a heap buffer (limit to 256 KB to avoid OOM)
+    const uint32_t kMaxJpeg = 256 * 1024;
+    if (dataLen > kMaxJpeg)
+        dataLen = kMaxJpeg;
+
+    uint8_t *jpegBuf = (uint8_t *)malloc(dataLen);
+    if (!jpegBuf)
+        return false;
+
+    f.seek(dataOffset);
+    uint32_t got = f.read(jpegBuf, dataLen);
+    if (got != dataLen)
+    {
+        free(jpegBuf);
+        return false;
+    }
+
+    // setSwapBytes(false): TJpgDec outputs RGB565 in big-endian byte order.
+    // The sprite has setSwapBytes(true), so pushImage() will byte-swap on the fly.
+    TJpgDec.setSwapBytes(false);
+    TJpgDec.setCallback(tjpgOutputCb);
+
+    // Find natural JPEG dimensions to pick the right scale factor
+    uint16_t jpgW = 0, jpgH = 0;
+    TJpgDec.getJpgSize(&jpgW, &jpgH, jpegBuf, dataLen);
+
+    // Pick the smallest power-of-2 scale that brings both dims to ≤64px
+    uint8_t scale = 1;
+    while (scale < 8 && (jpgW / scale > AlbumArt::W || jpgH / scale > AlbumArt::H))
+        scale *= 2;
+    TJpgDec.setJpgScale(scale);
+
+    // Centre the (possibly smaller) decoded image inside the 64×64 buffer.
+    // TJpgDec calls the callback with x/y relative to the drawJpg origin, so
+    // passing a non-zero origin shifts the image into the middle of the tile.
+    uint16_t scaledW = jpgW / scale;
+    uint16_t scaledH = jpgH / scale;
+    int16_t offX = (int16_t)((AlbumArt::W - scaledW) / 2);
+    int16_t offY = (int16_t)((AlbumArt::H - scaledH) / 2);
+
+    // Decode
+    s_artTarget = &out;
+    memset(out.pixels, 0, sizeof(out.pixels));
+    bool ok = (TJpgDec.drawJpg(offX, offY, jpegBuf, dataLen) == JDR_OK);
+    s_artTarget = nullptr;
+
+    free(jpegBuf);
+
+    out.hasArt = ok;
+    return ok;
 }

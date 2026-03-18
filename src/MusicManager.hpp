@@ -8,8 +8,8 @@
 #include <vector>
 #include <string>
 
-#define I2S_BCLK_PIN 17
-#define I2S_LRC_PIN 15
+#define I2S_BCLK_PIN 16
+#define I2S_LRC_PIN 17
 #define I2S_DOUT_PIN 21
 
 // SD card detect / hot-swap poll interval (ms)

@@ -798,7 +798,7 @@ void UIManager::live_loop(void *pvParameters)
         uint32_t drawTime = millis() - now;
         last_ms = now;
 
-        if (drawTime > 0)
+        if (drawTime > 0 && false) // Disable FPS display
         {
             // Draw FPS
             float fps = 1000.0 / drawTime;

@@ -22,6 +22,7 @@
 // =============================================================================
 
 #include "UI_manager.hpp"
+#include <esp_sleep.h>
 #include <esp_system.h>
 
 // Left panel list layout
@@ -621,7 +622,6 @@ void UIManager::drawPlaybackBtns(const PlayStats &ps)
     static const int btnY = SCREEN_H - btnH - 2;
 
     bool hasFocus = (focus == Focus::RIGHT);
-    const char *labels[3] = {"|<", ps.isPaused ? "|>" : "[]", ">|"};
 
     for (int i = 0; i < 3; i++)
     {
@@ -634,10 +634,34 @@ void UIManager::drawPlaybackBtns(const PlayStats &ps)
 
         sprite.fillRect(bx, btnY, btnW, btnH, bg);
         sprite.drawRect(bx, btnY, btnW, btnH, bdr);
-        sprite.setTextColor(fg, bg);
-        sprite.setTextDatum(MC_DATUM);
-        sprite.drawString(labels[i], bx + btnW / 2, btnY + btnH / 2 - 1);
-        sprite.setTextDatum(TL_DATUM);
+
+        int cx = bx + btnW / 2;
+        int cy = btnY + btnH / 2;
+
+        if (i == 0) // Prev  |◄
+        {
+            sprite.fillRect(cx - 7, cy - 5, 2, 10, fg);                          // bar
+            sprite.fillTriangle(cx - 4, cy, cx + 4, cy - 5, cx + 4, cy + 5, fg); // ◄
+        }
+        else if (i == 1) // Play ► / Pause ▌▌
+        {
+            if (!ps.isPlaying || ps.isPaused)
+            {
+                // Play ►
+                sprite.fillTriangle(cx - 5, cy - 6, cx - 5, cy + 6, cx + 6, cy, fg);
+            }
+            else
+            {
+                // Pause ▌▌
+                sprite.fillRect(cx - 5, cy - 5, 4, 10, fg);
+                sprite.fillRect(cx + 1, cy - 5, 4, 10, fg);
+            }
+        }
+        else // Next  ►|
+        {
+            sprite.fillTriangle(cx - 4, cy - 5, cx - 4, cy + 5, cx + 4, cy, fg); // ►
+            sprite.fillRect(cx + 5, cy - 5, 2, 10, fg);                          // bar
+        }
     }
 }
 
@@ -690,12 +714,16 @@ void UIManager::live_loop(void *pvParameters)
     ui->loadLibrary();
 
     uint32_t last_ms = 0;
+    uint32_t lastInteractionMs = millis();
+    static const uint32_t kAutoSleepMs = 25000; // 25 s of pause with no input
     while (true)
     {
         uint32_t now = millis();
 
         // ---- button ----
         int btn = ui->readBtn();
+        if (btn >= 0)
+            lastInteractionMs = now;
 
         // Track hold time for any button (prevRaw is updated by readBtn() above)
         // Release is debounced: heldBtn is only cleared after raw stays -1 for >30 ms
@@ -810,6 +838,23 @@ void UIManager::live_loop(void *pvParameters)
         }
 
         ui->sprite.pushSprite(0, 0);
+
+        // ---- auto deep-sleep when paused and idle for 25 s ----
+        {
+            PlayStats ps = musicManager.getPlayStats();
+            if (!ps.isPlaying && (now - lastInteractionMs >= kAutoSleepMs))
+            {
+                // Turn off display and backlight
+                ui->tft.writecommand(0x28); // display off (MIPI DCS)
+                ledcWrite(0, 0);
+                // Wake on any button press: GPIO 0 (boot button) or GPIO 1 (ADC ladder)
+                // Both are RTC-capable GPIOs on ESP32-S3; both go LOW when pressed.
+                uint64_t wakeupMask = (1ULL << GPIO_NUM_0) | (1ULL << GPIO_NUM_1);
+                esp_sleep_enable_ext1_wakeup(wakeupMask, ESP_EXT1_WAKEUP_ANY_LOW);
+                esp_deep_sleep_start();
+            }
+        }
+
         vTaskDelay(pdMS_TO_TICKS(2));
     }
 }
